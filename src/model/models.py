@@ -1,33 +1,44 @@
-import torch
-from torch import nn
-import torchvision
 import typing as tp
+
+import torch
+
+from torch import nn
+from torchvision import models
 
 
 class ImageEncoder(nn.Module):
     """
     Vision model. Encodes the image for attention model.
     """
-    def __init__(self, count_windows: tp.Optional[int] = 4):
+    def __init__(
+        self, 
+        model: tp.Optional[nn.Module] = models.efficientnet_b0(pretrained=True),
+        count_windows: tp.Optional[int] = 4, 
+        last_layer_for_del: tp.Optional[int] = 2,
+        feature_map: tp.Optional[int] = 7,
+        count_freeze_layers: tp.Optional[int] = 5
+    ):
         """
         Initialization
 
         Args:
+            model (tp.Optional[nn.Module], optional): Pretrained cv model. Defaults to models.efficientnet_b0(pretrained=True).
             count_windows (tp.Optional[int], optional): Count windows for attention. Defaults to 4.
+            last_layer_for_del (tp.Optional[int], optional): Count of last layers for delete from pretrained model. Defaults to 2.
+            feature_map (tp.Optional[int], optional): Dimention. Defaults to 7.
+            count_freeze_layers (tp.Optional[int], optional): Number of the last layers for which the gradient will not be considered . Defaults to 5.
         """
+
         super().__init__()
 
-        efficientnet = torchvision.models.efficientnet_b0(pretrained=True)  # pretrained efficientnet_b0
-        
-
         # Remove linear and pool layers (since we're not doing classification)
-        modules = list(efficientnet.children())[:-2]
-        self.cvnet = nn.Sequential(*modules)
+        modules = list(model.children())[:-last_layer_for_del]
+        self.model = nn.Sequential(*modules)
 
         # Resize image to fixed size to allow input images of variable size
         self.adaptive_pool = nn.AdaptiveAvgPool2d(output_size=count_windows)
-        self.avg_pool = nn.AvgPool2d(kernal_size=7)
-        self.fine_tune()
+        self.avg_pool = nn.AvgPool2d(kernal_size=feature_map)
+        self.fine_tune(count_freeze_layers=count_freeze_layers)
         # TODO add horizontal and vertical adaptive pooling [29]
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -40,24 +51,27 @@ class ImageEncoder(nn.Module):
         Returns:
             out (torch.Tensor): Encoded image
         """
-        batch_size = images.size(0)
-        out = self.efficientnet(images)  # (batch_size, 1280, 7, 7)
-        overal = self.avg_pool(out).permute(0, 2, 3, 1) # (batch_size, 1, 1, 1280)
-        out = self.adaptive_pool(out)  # (batch_size, 1280, count_windows, count_windows)
-        out = out.permute(0, 2, 3, 1).reshape(batch_size, -1, 1280)  # (batch_size, count_windows * count_windows, 1280)
-        
-        return torch.cat([out, overal], dim=2) 
 
-    def fine_tune(self, fine_tune: bool = True):
+        batch_size = images.size(0)
+        out_cv = self.model(images)  # (batch_size, 1280, feature_map, feature_map)
+        overall = self.avg_pool(out_cv).permute(0, 2, 3, 1).squeeze(1) # (batch_size, 1, 1280)
+        out_model = self.adaptive_pool(out_cv)  # (batch_size, 1280, count_windows, count_windows)
+        out_model = out_model.permute(0, 2, 3, 1).reshape(batch_size, -1, 1280)  # (batch_size, count_windows * count_windows, 1280)
+        
+        return torch.cat([out_model, overall], dim=2) 
+
+    def fine_tune(self, count_freeze_layers: tp.Optional[int], fine_tune: bool = True):
         """
         Allow or prevent the computation of gradients for convolutional blocks 2 through 4 of the encoder.
+
         Args:
+            count_freeze_layers (tp.Optional[int]): Number of the last layers for which the gradient will not be considered . Defaults to 5.
             fine_tune (bool, optional): Allow? Defaults to True.
         """
-        for p in self.resnet.parameters():
+        for p in self.model.parameters():
             p.requires_grad = False
         # If fine-tuning, only fine-tune convolutional blocks 2 through 4
-        for c in list(self.resnet.children())[5:]:
+        for c in list(self.model.children())[-count_freeze_layers:]:
             for p in c.parameters():
                 p.requires_grad = fine_tune
 
@@ -66,18 +80,19 @@ class Attention(nn.Module):
     Attention model. Creates the parts that the nlp model should pay attention to.
     """
 
-    def __init__(self, encoder_dim: torch.Tensor, decoder_dim: torch.Tensor, p: tp.Optional[float] = 0.2):
+    def __init__(self, encoder_dim: tp.Optional[int], decoder_dim: tp.Optional[int], p: tp.Optional[float] = 0.2):
         """
         Initialization
 
         Args:
-            encoder_dim (torch.Tensor): feature size of encoded images
-            decoder_dim (torch.Tensor): size of decoder's RNN
+            encoder_dim (tp.Optional[int], optional): feature size of encoded images
+            decoder_dim (tp.Optional[int], optional): size of decoder's RNN
         """
-        super(Attention, self).__init__()
-        self.wq = nn.Linear(decoder_dim, decoder_dim, bias=False)  # create Tensor Query
-        self.wk = nn.Linear(encoder_dim, decoder_dim, bias=False)  # create Tensor Key
-        self.wv = nn.Linear(decoder_dim, decoder_dim, bias=False)  # create Tensor Value
+
+        super().__init__()
+        self.wq = nn.Linear(decoder_dim, decoder_dim, bias=False)  # create Wq
+        self.wk = nn.Linear(encoder_dim, decoder_dim, bias=False)  # create Wk
+        self.wv = nn.Linear(decoder_dim, decoder_dim, bias=False)  # create Wv
         self.d = torch.sqrt(decoder_dim)  # create denominator for calculate attention_out 
         self.softmax = nn.Softmax(dim=1)  # softmax layer to calculate weights
         self.dropout = nn.Dropout(p=p)
@@ -92,6 +107,7 @@ class Attention(nn.Module):
         Returns:
             attention_out (torch.Tensor): attention weighted encoding
         """
+        
         query = self.dropout(self.wq(decoder_hidden))  # (batch_size, seq_len, decoder_dim)
 
         key = self.dropout(self.wk(encoder_out))  # (batch_size, num_windows, decoder_dim)
